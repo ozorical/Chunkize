@@ -7,3 +7,4 @@ venv/
 .venv/
 .idea/
 .vscode/
+bedrock_server

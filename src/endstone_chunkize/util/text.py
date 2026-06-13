@@ -7,6 +7,14 @@ def formatNumber(value):
     return f"{value:,}"
 
 
+def describeMessage(message):
+    text = getattr(message, "text", None)
+    if text is None:
+        return str(message)
+    params = getattr(message, "params", None) or ()
+    return " ".join([str(text), *(str(param) for param in params)])
+
+
 def formatDuration(seconds):
     seconds = int(seconds)
     hours, remainder = divmod(seconds, 3600)

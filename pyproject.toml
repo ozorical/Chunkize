@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-chunkize"
-version = "1.0.2"
+version = "1.0.3"
 description = "Chunk pregeneration for Endstone servers"
 authors = [{ name = "ozz" }]
 readme = "README.md"

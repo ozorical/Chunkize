@@ -1,7 +1,9 @@
 from endstone import ColorFormat, Player
+from endstone.form import ActionForm
 
 from endstone_chunkize.generation.plan import GenerationPlan
 from endstone_chunkize.generation.task import GenerationTask, buildTaskFromState
+from endstone_chunkize.settings import MODE_ORDER, MODE_PRESETS, MODE_RATES, applyMode
 from endstone_chunkize.util.dimensions import normalizeDimensionName
 from endstone_chunkize.util.text import PREFIX, formatNumber
 
@@ -12,6 +14,7 @@ USAGE_LINES = [
     "/chunkize resume",
     "/chunkize cancel",
     "/chunkize status",
+    "/chunkize config",
 ]
 
 
@@ -39,9 +42,53 @@ def handleCommand(plugin, sender, args):
         return handleCancel(plugin, sender)
     if action == "status":
         return handleStatus(plugin, sender)
+    if action == "config":
+        return handleConfig(plugin, sender, args[1:])
     for line in USAGE_LINES:
         sender.send_message(line)
     return True
+
+
+def handleConfig(plugin, sender, params):
+    if params:
+        mode = params[0].lower()
+        if mode not in MODE_PRESETS:
+            sendError(sender, "Mode must be light, medium or intense")
+            return True
+        applyMode(plugin, mode)
+        sendInfo(sender, f"{ColorFormat.GREEN}Speed mode set to {mode} ({MODE_RATES[mode]}), applies to the next /chunkize start")
+        return True
+    if not isinstance(sender, Player):
+        sendInfo(sender, f"Current speed mode: {plugin.settings.mode} ({MODE_RATES.get(plugin.settings.mode, '')})")
+        sendInfo(sender, "Set it with /chunkize config <light|medium|intense>")
+        return True
+    showConfigForm(plugin, sender)
+    return True
+
+
+def showConfigForm(plugin, player):
+    current = plugin.settings.mode
+    form = ActionForm(
+        title="Chunkize speed",
+        content=f"Current mode: {ColorFormat.YELLOW}{current}{ColorFormat.RESET}\n\nChoose how fast to pregenerate. Faster modes work the server harder.",
+    )
+    for mode in MODE_ORDER:
+        label = f"{mode.capitalize()}\n{MODE_RATES[mode]}"
+        if mode == current:
+            label = f"{label} (current)"
+        form.add_button(label, on_click=makeModeChoice(plugin, mode))
+    player.send_form(form)
+
+
+def makeModeChoice(plugin, mode):
+    def choose(player):
+        applyMode(plugin, mode)
+        player.send_message(
+            f"{PREFIX}{ColorFormat.GREEN}Speed mode set to {mode} ({MODE_RATES[mode]}), "
+            "applies to the next /chunkize start"
+        )
+
+    return choose
 
 
 def handleStart(plugin, sender, params):
@@ -101,7 +148,7 @@ def handleStart(plugin, sender, params):
     plugin.generationTask = task
     task.start()
     sendInfo(sender, f"{ColorFormat.GREEN}Started pregenerating a {shape} of radius {formatNumber(radius)} around {centerX}, {centerZ} in {dimension}")
-    sendInfo(sender, f"{formatNumber(plan.totalChunks)} chunks queued across {formatNumber(len(plan.cells))} batches, check /chunkize status anytime")
+    sendInfo(sender, f"{formatNumber(plan.totalChunks)} chunks queued across {formatNumber(len(plan.cells))} batches in {plugin.settings.mode} mode, check /chunkize status anytime")
     plugin.logger.info(
         f"Generation started: {dimension}, radius {radius}, center {centerX} {centerZ}, "
         f"{plan.totalChunks} chunks"

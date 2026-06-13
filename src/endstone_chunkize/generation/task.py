@@ -5,9 +5,13 @@ from endstone.command import CommandSenderWrapper
 from endstone_chunkize.generation.plan import GenerationPlan
 from endstone_chunkize.generation.progress import RateTracker
 from endstone_chunkize.util.dimensions import normalizeDimensionName
-from endstone_chunkize.util.text import PREFIX, formatDuration, formatNumber
+from endstone_chunkize.util.text import PREFIX, describeMessage, formatDuration, formatNumber
 
 STAMP_HEIGHTS = {"overworld": 319, "nether": 127, "the_end": 255}
+FLUSH_TIMEOUT_SECONDS = 60
+FLUSH_READY_MARKERS = ("commands.save-all.success", "ready to be copied")
+LOAD_CHECK_SECONDS = 5.0
+VERIFY_FLOOR = {"overworld": -40, "nether": 0}
 
 
 class AreaSlot:
@@ -17,7 +21,8 @@ class AreaSlot:
         self.cell = None
         self.pending = set()
         self.deadline = 0.0
-        self.settleUntil = 0.0
+        self.settleStart = 0.0
+        self.verifyPending = set()
         self.stampQueue = []
         self.active = False
         self.freedSerial = -1
@@ -44,6 +49,13 @@ class GenerationTask:
         self.failStreak = 0
         self.quietSender = None
         self.commandErrors = []
+        self.commandOutput = []
+        self.chunksSinceFlush = 0
+        self.flushing = False
+        self.flushDeadline = 0.0
+        self.activeTarget = settings.minActiveAreas
+        self.areaCeiling = settings.maxActiveAreas
+        self.lastLoadCheck = time.monotonic()
         self.startedAt = time.monotonic()
         self.lastSave = time.monotonic()
         self.lastLog = time.monotonic()
@@ -65,9 +77,12 @@ class GenerationTask:
         self.retryQueue.clear()
         self.retriedCells.clear()
         self.chunksDone = sum(cell.chunkCount for cell in self.plan.cells[:self.watermark])
+        self.activeTarget = self.settings.minActiveAreas
+        self.areaCeiling = self.settings.maxActiveAreas
         self.startedAt = time.monotonic()
         self.lastSave = time.monotonic()
         self.lastLog = time.monotonic()
+        self.lastLoadCheck = time.monotonic()
         self.clearStaleAreas()
         self.task = self.plugin.server.scheduler.run_task(
             self.plugin, self.tick, delay=1, period=self.settings.checkIntervalTicks
@@ -90,13 +105,15 @@ class GenerationTask:
             self.task = None
 
     def releaseSlots(self):
+        self.abortFlush()
         for slot in self.slots:
             if slot.active:
                 self.removeArea(slot)
             slot.active = False
             slot.pending.clear()
             slot.stampQueue = []
-            slot.settleUntil = 0.0
+            slot.verifyPending = set()
+            slot.settleStart = 0.0
         self.nextCell = self.watermark
         self.completedAhead.clear()
         self.retryQueue.clear()
@@ -108,10 +125,16 @@ class GenerationTask:
         for slot in self.slots:
             if slot.active:
                 self.checkSlot(slot, now)
-        self.fillSlots(now)
+        if self.flushing:
+            self.advanceFlush(now)
+        elif self.shouldFlush():
+            self.beginFlush(now)
+        else:
+            self.adjustConcurrency(now)
+            self.fillSlots(now)
         if self.task is None:
             return
-        if self.finished and not any(slot.active for slot in self.slots):
+        if self.finished and not self.flushing and not any(slot.active for slot in self.slots):
             self.finish()
             return
         if now - self.lastSave >= self.settings.saveIntervalSeconds:
@@ -123,13 +146,22 @@ class GenerationTask:
 
     def checkSlot(self, slot, now):
         if not slot.pending:
-            if slot.settleUntil == 0.0:
-                slot.settleUntil = now + self.settings.settleSeconds
+            if slot.settleStart == 0.0:
+                slot.settleStart = now
                 if self.settings.stampChunks:
                     slot.stampQueue = list(slot.cell.chunkCoords())
+                if self.settings.verifyGeneration:
+                    slot.verifyPending = set(slot.cell.chunkCoords())
                 return
             self.stampChunks(slot)
-            if now < slot.settleUntil or slot.stampQueue:
+            self.verifyChunks(slot)
+            elapsed = now - slot.settleStart
+            verifiedDone = (
+                elapsed >= self.settings.settleMinSeconds
+                and not slot.verifyPending
+                and not slot.stampQueue
+            )
+            if not (verifiedDone or elapsed >= self.settings.settleSeconds):
                 return
             self.releaseSlot(slot)
             self.markComplete(slot.cellIndex)
@@ -151,11 +183,15 @@ class GenerationTask:
 
     def fillSlots(self, now):
         loaded = None
+        activeCount = sum(1 for slot in self.slots if slot.active)
+        ceiling = min(self.activeTarget, self.settings.maxActiveAreas, self.areaCeiling)
         for slot in self.slots:
             if self.task is None:
                 return
             if slot.active or slot.freedSerial >= self.serial:
                 continue
+            if activeCount >= ceiling:
+                return
             cellIndex = self.peekNextCell()
             if cellIndex is None:
                 return
@@ -166,17 +202,12 @@ class GenerationTask:
             slot.cellIndex = cellIndex
             slot.cell = cell
             slot.deadline = now + self.settings.cellTimeoutSeconds
-            slot.settleUntil = 0.0
+            slot.settleStart = 0.0
+            slot.verifyPending = set()
             slot.stampQueue = []
             if not self.addArea(slot):
                 self.dispatch(f"execute in {self.dimension} run tickingarea remove {slot.name}")
-                self.failStreak += 1
-                if self.failStreak >= 5:
-                    self.plugin.logger.error(
-                        "Could not create a ticking area, the world may be at its limit. "
-                        "Free up ticking areas or lower maxActiveAreas, then run /chunkize resume"
-                    )
-                    self.pause(byUser=True)
+                self.handleAreaFailure(activeCount)
                 return
             self.failStreak = 0
             self.takeNextCell()
@@ -186,6 +217,50 @@ class GenerationTask:
                 self.chunksDone += alreadyLoaded
                 self.rate.record(alreadyLoaded)
             slot.active = True
+            activeCount += 1
+
+    def handleAreaFailure(self, activeCount):
+        self.failStreak += 1
+        if activeCount > 0:
+            self.areaCeiling = activeCount
+            self.activeTarget = activeCount
+            return
+        if self.failStreak >= 5:
+            self.plugin.logger.error(
+                "Could not create a ticking area, the world may be at its limit. "
+                "Free up ticking areas or lower maxActiveAreas, then run /chunkize resume"
+            )
+            self.pause(byUser=True)
+
+    def adjustConcurrency(self, now):
+        if now - self.lastLoadCheck < LOAD_CHECK_SECONDS:
+            return
+        self.lastLoadCheck = now
+        mspt = self.serverMspt()
+        if mspt is None or mspt <= 0.0:
+            self.activeTarget = min(self.settings.maxActiveAreas, self.areaCeiling)
+            return
+        target = self.settings.targetMspt
+        if mspt > target:
+            step = 2 if mspt > target * 1.3 else 1
+            self.activeTarget -= step
+        elif mspt < target * 0.8:
+            if self.activeTarget >= min(self.settings.maxActiveAreas, self.areaCeiling) \
+                    and self.areaCeiling < self.settings.maxActiveAreas:
+                self.areaCeiling += 1
+            self.activeTarget += 1
+        upper = min(self.settings.maxActiveAreas, self.areaCeiling)
+        self.activeTarget = max(self.settings.minActiveAreas, min(self.activeTarget, upper))
+
+    def serverMspt(self):
+        try:
+            value = self.plugin.server.average_mspt
+        except Exception:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def peekNextCell(self):
         if self.retryQueue:
@@ -214,7 +289,7 @@ class GenerationTask:
             slot.stampQueue.clear()
             return
         stampY = STAMP_HEIGHTS.get(self.dimension, 319)
-        for _ in range(min(16, len(slot.stampQueue))):
+        for _ in range(min(32, len(slot.stampQueue))):
             chunkX, chunkZ = slot.stampQueue.pop()
             try:
                 block = dimension.get_block_at(chunkX * 16 + 8, stampY, chunkZ * 16 + 8)
@@ -224,11 +299,73 @@ class GenerationTask:
             except Exception:
                 pass
 
+    def verifyChunks(self, slot):
+        if not slot.verifyPending:
+            return
+        floor = VERIFY_FLOOR.get(self.dimension)
+        if floor is None:
+            return
+        dimension = self.resolveDimension()
+        if dimension is None:
+            return
+        verified = []
+        for chunkX, chunkZ in slot.verifyPending:
+            try:
+                height = dimension.get_highest_block_y_at(chunkX * 16 + 8, chunkZ * 16 + 8)
+            except Exception:
+                height = None
+            if height is not None and height > floor:
+                verified.append((chunkX, chunkZ))
+        slot.verifyPending.difference_update(verified)
+
     def markComplete(self, cellIndex):
+        self.chunksSinceFlush += self.plan.cells[cellIndex].chunkCount
         self.completedAhead.add(cellIndex)
         while self.watermark in self.completedAhead:
             self.completedAhead.discard(self.watermark)
             self.watermark += 1
+
+    def shouldFlush(self):
+        if self.chunksSinceFlush <= 0:
+            return False
+        if self.settings.flushIntervalChunks <= 0:
+            return False
+        if self.chunksSinceFlush >= self.settings.flushIntervalChunks:
+            return True
+        return self.finished and not any(slot.active for slot in self.slots)
+
+    def beginFlush(self, now):
+        self.flushing = True
+        self.flushDeadline = now + FLUSH_TIMEOUT_SECONDS
+        self.dispatch("save hold")
+
+    def advanceFlush(self, now):
+        if self.flushReady():
+            self.endFlush()
+            return
+        if now >= self.flushDeadline:
+            self.plugin.logger.warning(
+                "World save did not confirm in time, resuming saves anyway"
+            )
+            self.endFlush()
+
+    def flushReady(self):
+        self.dispatch("save query")
+        text = " ".join(
+            describeMessage(message)
+            for message in (*self.commandOutput, *self.commandErrors)
+        ).lower()
+        return any(marker in text for marker in FLUSH_READY_MARKERS)
+
+    def endFlush(self):
+        self.flushing = False
+        self.chunksSinceFlush = 0
+        self.dispatch("save resume")
+
+    def abortFlush(self):
+        if self.flushing:
+            self.flushing = False
+            self.dispatch("save resume")
 
     def onChunkLoad(self, chunkX, chunkZ, dimensionName):
         if self.task is None:
@@ -276,13 +413,14 @@ class GenerationTask:
         if self.quietSender is None:
             self.quietSender = CommandSenderWrapper(
                 self.plugin.server.command_sender,
-                on_message=lambda message: None,
+                on_message=self.commandOutput.append,
                 on_error=self.commandErrors.append,
             )
         return self.quietSender
 
     def dispatch(self, commandLine):
         self.commandErrors.clear()
+        self.commandOutput.clear()
         try:
             handled = self.plugin.server.dispatch_command(self.commandSender(), commandLine)
         except Exception:
@@ -335,6 +473,15 @@ class GenerationTask:
                 lines.append(f"Speed: {speed:.1f} chunks/s, ETA: {eta}")
             else:
                 lines.append("Speed: warming up")
+            if self.flushing:
+                lines.append("Flushing world save to disk")
+            activeCount = sum(1 for slot in self.slots if slot.active)
+            mspt = self.serverMspt()
+            load = f"{mspt:.0f} ms/tick" if mspt is not None else "unknown"
+            lines.append(
+                f"Active areas: {activeCount} (target {self.activeTarget} of {self.settings.maxActiveAreas}), "
+                f"server load {load}"
+            )
         lines.append(
             f"Center: {self.plan.centerX}, {self.plan.centerZ} | "
             f"Radius: {formatNumber(self.plan.radius)} | Shape: {self.plan.shape}"

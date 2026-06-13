@@ -1,5 +1,7 @@
 import time
 
+from endstone.command import CommandSenderWrapper
+
 from endstone_chunkize.generation.plan import GenerationPlan
 from endstone_chunkize.generation.progress import RateTracker
 from endstone_chunkize.util.dimensions import normalizeDimensionName
@@ -13,8 +15,8 @@ class AreaSlot:
         self.cell = None
         self.pending = set()
         self.deadline = 0.0
-        self.retried = False
         self.active = False
+        self.freedSerial = -1
 
 
 class GenerationTask:
@@ -26,13 +28,18 @@ class GenerationTask:
         self.watermark = watermark
         self.nextCell = watermark
         self.completedAhead = set()
+        self.retryQueue = []
+        self.retriedCells = set()
         self.slots = [AreaSlot(f"chunkize{index}") for index in range(settings.maxActiveAreas)]
         self.chunksDone = sum(cell.chunkCount for cell in plan.cells[:watermark])
         self.skippedChunks = skippedChunks
         self.rate = RateTracker()
         self.task = None
         self.paused = False
+        self.serial = 0
         self.failStreak = 0
+        self.quietSender = None
+        self.commandErrors = []
         self.startedAt = time.monotonic()
         self.lastSave = time.monotonic()
         self.lastLog = time.monotonic()
@@ -51,6 +58,8 @@ class GenerationTask:
         self.paused = False
         self.nextCell = self.watermark
         self.completedAhead.clear()
+        self.retryQueue.clear()
+        self.retriedCells.clear()
         self.chunksDone = sum(cell.chunkCount for cell in self.plan.cells[:self.watermark])
         self.startedAt = time.monotonic()
         self.lastSave = time.monotonic()
@@ -84,16 +93,16 @@ class GenerationTask:
             slot.pending.clear()
         self.nextCell = self.watermark
         self.completedAhead.clear()
+        self.retryQueue.clear()
+        self.retriedCells.clear()
 
     def tick(self):
+        self.serial += 1
         now = time.monotonic()
         for slot in self.slots:
             if slot.active:
                 self.checkSlot(slot, now)
-        for slot in self.slots:
-            if not slot.active:
-                if not self.assignSlot(slot, now):
-                    break
+        self.fillSlots(now)
         if self.task is None:
             return
         if self.finished and not any(slot.active for slot in self.slots):
@@ -108,57 +117,93 @@ class GenerationTask:
 
     def checkSlot(self, slot, now):
         if not slot.pending:
-            self.completeSlot(slot)
+            self.releaseSlot(slot)
+            self.markComplete(slot.cellIndex)
             return
         if now < slot.deadline:
             return
-        if not slot.retried:
-            slot.retried = True
-            slot.deadline = now + self.settings.cellTimeoutSeconds
-            self.removeArea(slot)
-            self.addArea(slot)
+        self.releaseSlot(slot)
+        if slot.cellIndex in self.retriedCells:
+            self.skippedChunks += len(slot.pending)
+            self.plugin.logger.warning(
+                f"Batch {slot.cellIndex} timed out twice, skipping {len(slot.pending)} chunks"
+            )
+            slot.pending.clear()
+            self.markComplete(slot.cellIndex)
             return
-        self.skippedChunks += len(slot.pending)
-        self.plugin.logger.warning(
-            f"Batch {slot.cellIndex} timed out with {len(slot.pending)} chunks unloaded, moving on"
-        )
+        self.retriedCells.add(slot.cellIndex)
+        self.retryQueue.append(slot.cellIndex)
         slot.pending.clear()
-        self.completeSlot(slot)
 
-    def assignSlot(self, slot, now):
-        if self.nextCell >= len(self.plan.cells):
-            return False
-        cell = self.plan.cells[self.nextCell]
-        slot.cellIndex = self.nextCell
-        slot.cell = cell
-        slot.retried = False
-        slot.deadline = now + self.settings.cellTimeoutSeconds
-        if not self.addArea(slot):
-            self.failStreak += 1
-            if self.failStreak >= 5:
-                self.plugin.logger.error(
-                    "Could not create a ticking area, the world may be at its limit. "
-                    "Free up ticking areas or lower maxActiveAreas, then run /chunkize resume"
-                )
-                self.pause(byUser=True)
-            return False
-        self.failStreak = 0
+    def fillSlots(self, now):
+        loaded = None
+        emptySkips = 0
+        for slot in self.slots:
+            if self.task is None:
+                return
+            if slot.active or slot.freedSerial >= self.serial:
+                continue
+            while True:
+                cellIndex = self.peekNextCell()
+                if cellIndex is None:
+                    return
+                cell = self.plan.cells[cellIndex]
+                if loaded is None:
+                    loaded = self.loadedChunkSet()
+                pending = {coord for coord in cell.chunkCoords() if coord not in loaded}
+                if not pending:
+                    if emptySkips >= 25:
+                        return
+                    emptySkips += 1
+                    self.takeNextCell()
+                    self.chunksDone += cell.chunkCount
+                    self.rate.record(cell.chunkCount)
+                    self.markComplete(cellIndex)
+                    continue
+                slot.cellIndex = cellIndex
+                slot.cell = cell
+                slot.deadline = now + self.settings.cellTimeoutSeconds
+                if not self.addArea(slot):
+                    self.dispatch(f"execute in {self.dimension} run tickingarea remove {slot.name}")
+                    self.failStreak += 1
+                    if self.failStreak >= 5:
+                        self.plugin.logger.error(
+                            "Could not create a ticking area, the world may be at its limit. "
+                            "Free up ticking areas or lower maxActiveAreas, then run /chunkize resume"
+                        )
+                        self.pause(byUser=True)
+                    return
+                self.failStreak = 0
+                self.takeNextCell()
+                slot.pending = pending
+                alreadyLoaded = cell.chunkCount - len(pending)
+                if alreadyLoaded:
+                    self.chunksDone += alreadyLoaded
+                    self.rate.record(alreadyLoaded)
+                slot.active = True
+                break
+
+    def peekNextCell(self):
+        if self.retryQueue:
+            return self.retryQueue[0]
+        if self.nextCell < len(self.plan.cells):
+            return self.nextCell
+        return None
+
+    def takeNextCell(self):
+        if self.retryQueue:
+            return self.retryQueue.pop(0)
+        index = self.nextCell
         self.nextCell += 1
-        loaded = self.loadedChunkSet()
-        slot.pending = {coord for coord in cell.chunkCoords() if coord not in loaded}
-        alreadyLoaded = cell.chunkCount - len(slot.pending)
-        if alreadyLoaded:
-            self.chunksDone += alreadyLoaded
-            self.rate.record(alreadyLoaded)
-        slot.active = True
-        if not slot.pending:
-            self.completeSlot(slot)
-        return True
+        return index
 
-    def completeSlot(self, slot):
+    def releaseSlot(self, slot):
         self.removeArea(slot)
         slot.active = False
-        self.completedAhead.add(slot.cellIndex)
+        slot.freedSerial = self.serial
+
+    def markComplete(self, cellIndex):
+        self.completedAhead.add(cellIndex)
         while self.watermark in self.completedAhead:
             self.completedAhead.discard(self.watermark)
             self.watermark += 1
@@ -174,8 +219,6 @@ class GenerationTask:
                 slot.pending.discard(coord)
                 self.chunksDone += 1
                 self.rate.record(1)
-                if not slot.pending:
-                    self.completeSlot(slot)
                 return
 
     def loadedChunkSet(self):
@@ -207,12 +250,22 @@ class GenerationTask:
         for index in range(10):
             self.dispatch(f"execute in {self.dimension} run tickingarea remove chunkize{index}")
 
+    def commandSender(self):
+        if self.quietSender is None:
+            self.quietSender = CommandSenderWrapper(
+                self.plugin.server.command_sender,
+                on_message=lambda message: None,
+                on_error=self.commandErrors.append,
+            )
+        return self.quietSender
+
     def dispatch(self, commandLine):
-        server = self.plugin.server
+        self.commandErrors.clear()
         try:
-            return server.dispatch_command(server.command_sender, commandLine)
+            handled = self.plugin.server.dispatch_command(self.commandSender(), commandLine)
         except Exception:
             return False
+        return handled and not self.commandErrors
 
     def saveState(self, userPaused):
         self.plugin.progressStore.save({

@@ -45,6 +45,8 @@ Examples:
 /chunkize start 10000 overworld 0 0 circle
 ```
 
+![Chunkize running in game](demo.png)
+
 ## Configuration
 
 `plugins/chunkize/config.toml` is created on first run.

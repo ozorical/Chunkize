@@ -1,0 +1,29 @@
+name: Auto Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - run: python3 -m pip install --user pipx
+
+      - name: Build wheel
+        run: pipx run build --wheel
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: dist/*.whl

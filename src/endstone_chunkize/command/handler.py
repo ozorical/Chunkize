@@ -114,7 +114,7 @@ def handleStart(plugin, sender, params):
     centerZ = 0
     if isinstance(sender, Player):
         location = sender.location
-        dimension = normalizeDimensionName(location.dimension.name)
+        dimension = normalizeDimensionName(location.dimension)
         centerX = location.block_x
         centerZ = location.block_z
     if len(params) > 1:

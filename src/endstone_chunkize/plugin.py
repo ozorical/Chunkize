@@ -76,4 +76,4 @@ class ChunkizePlugin(Plugin):
     def onChunkLoad(self, event: ChunkLoadEvent):
         task = self.generationTask
         if task is not None:
-            task.onChunkLoad(event.chunk.x, event.chunk.z, event.chunk.dimension.name)
+            task.onChunkLoad(event.chunk.x, event.chunk.z, event.chunk.dimension)

@@ -388,7 +388,7 @@ class GenerationTask:
 
     def resolveDimension(self):
         for dimension in self.plugin.server.level.dimensions:
-            if normalizeDimensionName(dimension.name) == self.dimension:
+            if normalizeDimensionName(dimension) == self.dimension:
                 return dimension
         return None
 
